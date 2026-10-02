@@ -47,12 +47,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # Must match `rust-version` in Cargo.toml. cargo_metadata 0.23 sets the
+      # floor at 1.86.
+      - uses: dtolnay/rust-toolchain@1.86.0
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Test on the minimum supported rust version
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   package:
     name: package
@@ -65,10 +67,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify the crate packages cleanly
-        run: cargo package --locked --allow-dirty
+        run: cargo package --locked
 
-      - name: Verify the packaged crate builds and passes its tests
+      # `cargo package` writes both target/package/<name>-<version>/ and a
+      # sibling .crate file, so select the directory rather than globbing both.
+      - name: Verify the packaged crate builds, installs and passes its tests
         run: |
-          cargo install --path target/package/cargo-remote-3000 --root /tmp/probe
+          packaged="$(find target/package -maxdepth 1 -type d -name 'cargo-remote-3000-*')"
+          echo "testing $packaged"
+          cargo test --locked --manifest-path "$packaged/Cargo.toml"
+          cargo install --locked --path "$packaged" --root /tmp/probe
           /tmp/probe/bin/cargo-remote-3000 --version
-          cargo test --manifest-path target/package/cargo-remote-3000/Cargo.toml
+          /tmp/probe/bin/cargo-remote-3000 remote-3000 --help > /dev/null

@@ -9,7 +9,8 @@ license = "MIT"
 repository = "https://github.com/Apothic-AI/cargo-remote-3000"
 homepage = "https://github.com/Apothic-AI/cargo-remote-3000"
 edition = "2021"
-rust-version = "1.85"
+# cargo_metadata 0.23 requires 1.86. The CI msrv job runs this exact version.
+rust-version = "1.86"
 readme = "README.md"
 
 [[bin]]

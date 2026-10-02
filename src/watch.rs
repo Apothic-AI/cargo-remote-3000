@@ -182,11 +182,24 @@ mod tests {
 
     #[test]
     fn events_outside_the_watched_root_are_ignored() {
-        let event = event(
-            &["/somewhere/else/main.rs"],
-            EventKind::Modify(ModifyKind::Any),
-        );
+        // A real notify event carries an absolute path, which on Windows means
+        // one with a drive prefix, so build the path with the platform's own
+        // separator rather than a hardcoded `/`.
+        let outside = std::env::temp_dir().join("elsewhere").join("main.rs");
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![outside],
+            attrs: Default::default(),
+        };
         assert!(!should_trigger(&event, Path::new("/project")));
+    }
+
+    #[test]
+    fn relative_event_paths_are_treated_as_project_relative() {
+        // notify reports absolute paths, but a relative one should still be
+        // understood rather than silently dropped.
+        let event = event(&["src/main.rs"], EventKind::Modify(ModifyKind::Any));
+        assert!(should_trigger(&event, Path::new("/project")));
     }
 
     #[test]

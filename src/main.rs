@@ -1,319 +1,277 @@
-use std::collections::hash_map::DefaultHasher;
-use std::fs::canonicalize;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::process::{exit, Command, Stdio};
-use structopt::StructOpt;
+//! cargo-remote-3000: run `cargo` on a remote build server and bring the
+//! artifacts home.
 
-use log::{error, info};
-
+mod cli;
 mod config;
+mod project;
+mod remote;
+mod watch;
 
-const PROGRESS_FLAG: &str = "--info=progress2";
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::process::ExitCode;
 
-#[derive(StructOpt, Debug)]
-pub struct RemoteOpts {
-    /// The name of the remote specified in the config
-    #[structopt(short = "r", long = "remote")]
-    name: Option<String>,
+use anyhow::{bail, Result};
+use clap::Parser;
+use log::{debug, info};
 
-    /// Remote ssh build server with user or the name of the ssh entry
-    #[structopt(short = "H", long = "remote-host")]
-    host: Option<String>,
+use cli::{Cli, Command, Remote as RemoteArgs};
+use config::Config;
+use project::Project;
+use remote::Session;
 
-    /// The ssh port to communicate with the build server
-    #[structopt(short = "p", long = "remote-ssh-port")]
-    ssh_port: Option<u16>,
-
-    /// The directory where cargo builds the project
-    #[structopt(short, long = "remote-temp-dir")]
-    temp_dir: Option<String>,
-
-    #[structopt(
-        short = "e",
-        long = "env",
-        help = "Environment profile. default_value = /etc/profile"
-    )]
-    env: Option<String>,
+/// Exit codes. A failing remote build propagates its own status instead.
+mod exit {
+    pub const USAGE: u8 = 2;
+    pub const SETUP: u8 = 3;
+    pub const TRANSFER: u8 = 4;
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "cargo-remote", bin_name = "cargo")]
-enum Opts {
-    #[structopt(name = "remote")]
-    Remote {
-        #[structopt(flatten)]
-        remote_opts: RemoteOpts,
-
-        #[structopt(
-            short = "b",
-            long = "build-env",
-            help = "Set remote environment variables. RUST_BACKTRACE, CC, LIB, etc. ",
-            default_value = "RUST_BACKTRACE=1"
-        )]
-        build_env: String,
-
-        #[structopt(
-            short = "d",
-            long = "rustup-default",
-            help = "Rustup default (stable|beta|nightly)",
-            default_value = "stable"
-        )]
-        rustup_default: String,
-
-        #[structopt(
-            short = "c",
-            long = "copy-back",
-            help = "Transfer the target folder or specific file from that folder back to the local machine"
-        )]
-        copy_back: Option<Option<String>>,
-
-        #[structopt(
-            long = "no-copy-lock",
-            help = "don't transfer the Cargo.lock file back to the local machine"
-        )]
-        no_copy_lock: bool,
-
-        #[structopt(
-            long = "manifest-path",
-            help = "Path to the manifest to execute",
-            default_value = "Cargo.toml",
-            parse(from_os_str)
-        )]
-        manifest_path: PathBuf,
-
-        #[structopt(
-            short = "h",
-            long = "transfer-hidden",
-            help = "Transfer hidden files and directories to the build server"
-        )]
-        hidden: bool,
-
-        #[structopt(
-            short = "G",
-            long = "no-transfer-git",
-            help = "Do not transfer .git. Note that .git is hidden so .git is transferred only if --transfer-hidden is set and --no-transfer-git is not set"
-        )]
-        no_transfer_git: bool,
-
-        #[structopt(help = "cargo command that will be executed remotely")]
-        command: String,
-
-        #[structopt(
-            short = "w",
-            long = "working-directory",
-            help = "The working directory to copy files from. Default is your workspace root."
-        )]
-        working_directory: Option<String>,
-
-        #[structopt(
-            help = "cargo options and flags that will be applied remotely",
-            name = "remote options"
-        )]
-        options: Vec<String>,
-    },
+/// An error plus the exit code it should produce.
+struct Failure {
+    code: u8,
+    error: anyhow::Error,
 }
 
-fn main() {
-    simple_logger::init().unwrap();
+impl Failure {
+    fn new(code: u8, error: anyhow::Error) -> Self {
+        Self { code, error }
+    }
+}
 
-    let Opts::Remote {
-        remote_opts,
-        build_env,
-        rustup_default,
-        copy_back,
-        no_copy_lock,
-        manifest_path,
-        hidden,
-        no_transfer_git,
-        command,
-        working_directory,
-        options,
-    } = Opts::from_args();
+impl From<Failure> for ExitCode {
+    fn from(value: Failure) -> Self {
+        ExitCode::from(value.code)
+    }
+}
 
-    let mut metadata_cmd = cargo_metadata::MetadataCommand::new();
-    metadata_cmd.manifest_path(manifest_path).no_deps();
+type Outcome = std::result::Result<ExitCode, Failure>;
 
-    let project_metadata = metadata_cmd.exec().unwrap();
+fn main() -> ExitCode {
+    init_logging();
 
-    let project_root = match working_directory {
-        Some(path) => canonicalize(PathBuf::from(path))
-            .expect("The provided working directory does not exist or has an error."),
-        None => project_metadata.workspace_root.clone(),
-    };
-    info!(
-        "Workspace root: {:?}",
-        project_metadata.workspace_root.clone()
-    );
-    info!("Project root: {:?}", project_root);
-
-    let diff_from_project_root = project_metadata
-        .workspace_root
-        .strip_prefix(project_root.clone())
-        .expect("Working directory should be an ancestor of the workspace root")
-        .to_owned();
-
-    let conf = match config::Config::new(&project_root) {
-        Ok(conf) => conf,
-        Err(error) => {
-            error!("{}", error);
-            exit(-3);
+    match run() {
+        Ok(code) => code,
+        Err(failure) => {
+            // `{:#}` prints the whole context chain, which is what makes a
+            // nested transfer error understandable.
+            eprintln!("error: {:#}", failure.error);
+            ExitCode::from(failure.code)
         }
+    }
+}
+
+/// Set up logging before arguments are parsed.
+///
+/// `RUST_LOG` wins; otherwise `-v` on the command line raises the level to
+/// debug, which is what prints each rsync and ssh invocation.
+fn init_logging() {
+    let verbose = std::env::args().any(|arg| arg == "-v" || arg == "--verbose");
+    let level = match std::env::var("RUST_LOG").ok().as_deref() {
+        Some("trace") | Some("debug") => log::LevelFilter::Debug,
+        Some("warn") => log::LevelFilter::Warn,
+        Some("error") => log::LevelFilter::Error,
+        _ if verbose => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Info,
+    };
+    let _ = env_logger::Builder::new().filter_level(level).try_init();
+}
+
+fn run() -> Outcome {
+    let Command::Remote(args) = Cli::parse().command;
+
+    if args.verbose > 0 {
+        debug!("parsed arguments: {args:?}");
+    }
+
+    let project = Project::resolve(&args).map_err(|error| Failure::new(exit::SETUP, error))?;
+
+    let conf =
+        Config::load(project.project_root()).map_err(|error| Failure::new(exit::SETUP, error))?;
+    let remote = conf
+        .get_remote(&args.remote)
+        .map_err(|error| Failure::new(exit::SETUP, error))?;
+
+    let build_root = remote_build_root(&remote.temp_dir, project.project_root());
+    let session = Session {
+        remote: &remote,
+        project_root: project.project_root(),
+        workspace_root: project.workspace_root(),
+        build_root: build_root.clone(),
+        remote_workspace_root: join_remote(&build_root, project.workspace_relative()),
+        remote_crate_dir: join_remote(&build_root, project.crate_relative()),
+        local_target_dir: project.local_target_dir().to_path_buf(),
+        remote_target_dir: project.remote_target_dir(&build_root),
+        upload_excludes: remote.exclude.clone(),
+        transfer_hidden: args.transfer_hidden,
+        no_transfer_git: args.no_transfer_git,
+        verbose: args.verbose > 0,
     };
 
-    let remote = match conf.get_remote(&remote_opts) {
-        Some(remote) => remote,
-        None => {
-            error!("No remote build server was defined (use config file or the --remote flags)");
-            exit(4);
+    info!("Build path: {build_root}");
+    info!("Remote crate directory: {}", session.remote_crate_dir);
+
+    if args.watch {
+        return run_watch(&args, &session);
+    }
+
+    session
+        .upload()
+        .map_err(|error| Failure::new(exit::TRANSFER, error))?;
+
+    let status = session
+        .run_remote_command(
+            &args.build_env,
+            &args.rustup_default,
+            &args.command,
+            &args.args,
+        )
+        .map_err(|error| Failure::new(exit::TRANSFER, error))?;
+
+    copy_back(&args, &session).map_err(|error| Failure::new(exit::TRANSFER, error))?;
+
+    if !status.success() {
+        info!("Remote build exited with status {status}");
+        // Mirror the remote status so CI and shell scripts see the truth.
+        let code = status
+            .code()
+            .and_then(|c| u8::try_from(c).ok())
+            .unwrap_or(exit::SETUP);
+        return Ok(ExitCode::from(code));
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Copy artifacts and the lock file home.
+fn copy_back(args: &RemoteArgs, session: &Session) -> Result<()> {
+    if let Some(relative) = &args.copy_back {
+        let relative = relative.as_deref().unwrap_or("");
+        info!(
+            "Copying target/{relative} back to {}",
+            session.local_target_dir.display()
+        );
+        session.download_target(relative)?;
+    }
+
+    if !args.no_copy_lock {
+        // A missing lock file is not a reason to fail the build.
+        if let Err(error) = session.download_lock_file() {
+            debug!("skipping Cargo.lock transfer: {error:#}");
         }
+    }
+
+    Ok(())
+}
+
+/// Watch mode: one build, then a rebuild on every source change.
+fn run_watch(args: &RemoteArgs, session: &Session) -> Outcome {
+    if args.copy_back.is_some() {
+        return Err(Failure::new(
+            exit::USAGE,
+            anyhow::anyhow!(
+                "--watch rebuilds continuously and the artifacts stay on the build \
+                 server, so --copy-back is not supported in watch mode"
+            ),
+        ));
+    }
+
+    let run_build = || -> Result<()> {
+        session.upload()?;
+        let status = session.run_remote_command(
+            &args.build_env,
+            &args.rustup_default,
+            &args.command,
+            &args.args,
+        )?;
+        if !status.success() {
+            bail!("remote build failed with {status}");
+        }
+        Ok(())
     };
 
-    let build_server = remote.host;
+    if let Err(error) = run_build() {
+        // A first build failure is worth reporting loudly.
+        return Err(Failure::new(exit::TRANSFER, error));
+    }
 
-    // generate a unique build path by using the hashed project dir as folder on the remote machine
+    match watch::watch(session.project_root, &session.upload_excludes, run_build) {
+        Ok(rebuilds) => {
+            info!("Watch session ended after {rebuilds} rebuilds");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => Err(Failure::new(exit::SETUP, error)),
+    }
+}
+
+/// Stable per-project build directory on the build server.
+///
+/// Hashing the local path means two checkouts of the same project on different
+/// machines still land in one remote directory, and re-running after a reboot
+/// reuses the previous target directory instead of rebuilding from scratch.
+fn remote_build_root(temp_dir: &str, project_root: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     project_root.hash(&mut hasher);
-    let build_path = format!("{}/{}", remote.temp_dir, hasher.finish());
+    // A leading `~` is left for the remote shell to expand: the build host's
+    // home directory has nothing to do with the local one.
+    let temp_dir = temp_dir.trim_end_matches('/');
+    format!("{temp_dir}/{:016x}", hasher.finish())
+}
 
-    let mut build_workspace = PathBuf::from(build_path.clone());
-    build_workspace.push(diff_from_project_root.clone());
+/// Join a remote path fragment onto a remote base directory.
+fn join_remote(base: &str, relative: &Path) -> String {
+    if relative.as_os_str().is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        relative.to_string_lossy()
+    )
+}
 
-    let mut project_workspace = project_root.clone();
-    project_workspace.push(diff_from_project_root);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    info!("Transferring sources to build server.");
-    // transfer project to build server
-    let mut rsync_to = Command::new("rsync");
-    rsync_to
-        .arg("-aP")
-        .arg("--delete")
-        .arg("--compress")
-        .arg("-e")
-        .arg(format!("ssh -p {}", remote.ssh_port))
-        .arg(PROGRESS_FLAG)
-        .arg("--exclude")
-        .arg("target");
-
-    if !hidden {
-        rsync_to.arg("--exclude").arg(".*");
+    #[test]
+    fn build_root_is_stable_for_the_same_path() {
+        let a = remote_build_root("~/remote-builds", Path::new("/home/me/project"));
+        let b = remote_build_root("~/remote-builds", Path::new("/home/me/project"));
+        assert_eq!(a, b);
+        assert!(a.ends_with(|c: char| c.is_ascii_hexdigit()), "{a}");
     }
 
-    if no_transfer_git {
-        rsync_to.arg("--exclude").arg(".git");
+    #[test]
+    fn build_root_differs_per_project() {
+        let a = remote_build_root("~/remote-builds", Path::new("/home/me/one"));
+        let b = remote_build_root("~/remote-builds", Path::new("/home/me/two"));
+        assert_ne!(a, b);
     }
 
-    rsync_to
-        .arg("--rsync-path")
-        .arg("mkdir -p remote-builds && rsync")
-        .arg(format!("{}/", project_root.to_string_lossy()))
-        .arg(format!("{}:{}", build_server, build_path))
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .stdin(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            error!("Failed to transfer project to build server (error: {})", e);
-            exit(-4);
-        });
-    info!("Build ENV: {:?}", build_env);
-    info!("Environment profile: {:?}", remote.env);
-    info!("Build path: {:?}", build_path);
-    let build_command = format!(
-        "source {}; rustup default {}; cd {}; {} cargo {} {}",
-        remote.env,
-        rustup_default,
-        build_workspace.to_string_lossy(),
-        build_env,
-        command,
-        options.join(" ")
-    );
-
-    info!("Starting build process.");
-    let output = Command::new("ssh")
-        .args(["-p", &remote.ssh_port.to_string()])
-        .arg("-t")
-        .arg(&build_server)
-        .arg(build_command)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .stdin(Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            error!("Failed to run cargo command remotely (error: {})", e);
-            exit(-5);
-        });
-
-    if let Some(file_name) = copy_back {
-        info!("Transferring artifacts back to client.");
-        let file_name = file_name.unwrap_or_else(String::new);
-        Command::new("rsync")
-            .arg("-aP")
-            .arg("--delete")
-            .arg("--compress")
-            .arg("--exclude")
-            .arg("deps/")
-            .arg("--exclude")
-            .arg("build/")
-            .arg("-e")
-            .arg(format!("ssh -p {}", remote.ssh_port))
-            .arg(PROGRESS_FLAG)
-            .arg(format!(
-                "{}:{}/target/{}",
-                build_server,
-                build_workspace.to_string_lossy(),
-                file_name
-            ))
-            .arg(format!(
-                "{}/target/{}",
-                project_workspace.to_string_lossy(),
-                file_name
-            ))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::inherit())
-            .output()
-            .unwrap_or_else(|e| {
-                error!(
-                    "Failed to transfer target back to local machine (error: {})",
-                    e
-                );
-                exit(-6);
-            });
+    #[test]
+    fn build_root_normalises_the_temp_dir() {
+        let with_slash = remote_build_root("~/remote-builds/", Path::new("/p"));
+        let without = remote_build_root("~/remote-builds", Path::new("/p"));
+        assert_eq!(with_slash, without);
+        assert!(!with_slash.contains("//"), "{with_slash}");
     }
 
-    if !no_copy_lock {
-        info!("Transferring Cargo.lock file back to client.");
-        Command::new("rsync")
-            .arg("-aP")
-            .arg("--delete")
-            .arg("--compress")
-            .arg("-e")
-            .arg(format!("ssh -p {}", remote.ssh_port))
-            .arg(PROGRESS_FLAG)
-            .arg(format!(
-                "{}:{}/Cargo.lock",
-                build_server,
-                build_workspace.to_string_lossy()
-            ))
-            .arg(format!(
-                "{}/Cargo.lock",
-                project_workspace.to_string_lossy()
-            ))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::inherit())
-            .output()
-            .unwrap_or_else(|e| {
-                error!(
-                    "Failed to transfer Cargo.lock back to local machine (error: {})",
-                    e
-                );
-                exit(-7);
-            });
+    #[test]
+    fn build_root_leaves_the_tilde_for_the_remote_shell() {
+        // The build directory lives on the build server, so expanding `~` with
+        // the *local* home directory would point at the wrong place.
+        let root = remote_build_root("~/remote-builds", Path::new("/p"));
+        assert!(root.starts_with("~/remote-builds/"), "{root}");
     }
 
-    if !output.status.success() {
-        exit(output.status.code().unwrap_or(1))
+    #[test]
+    fn join_remote_handles_the_workspace_root_itself() {
+        assert_eq!(join_remote("/remote/abc", Path::new("")), "/remote/abc");
+        assert_eq!(
+            join_remote("/remote/abc", Path::new("crates/foo")),
+            "/remote/abc/crates/foo"
+        );
     }
 }

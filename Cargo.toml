@@ -1,21 +1,36 @@
 [package]
-name = "cargo-remote"
-description = "Cargo subcommand to build rust projects remotely"
-keywords = ["remote", "build"]
-categories = ["command-line-utilities", "development-tools::build-utils", "development-tools::cargo-plugins"]
-maintenance = { status = "experimental" }
-version = "0.2.2"
-authors = ["Sebastian Geisler <sgeisler@wh2.tu-dresden.de>", "Zannis Kalampoukis <zannis.kal@gmail.com>"]
+name = "cargo-remote-3000"
+description = "Cargo subcommand to build Rust projects on a remote build server over SSH"
+keywords = ["remote", "build", "ssh", "rsync", "offload"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+version = "1.0.0"
+authors = ["Sebastian Geisler <sgeisler@wh2.tu-dresden.de>", "cargo-remote-3000 contributors"]
 license = "MIT"
 repository = "https://github.com/sgeisler/cargo-remote"
-edition = "2018"
+edition = "2021"
+rust-version = "1.85"
 readme = "README.md"
 
+[[bin]]
+name = "cargo-remote-3000"
+path = "src/main.rs"
+
 [dependencies]
-structopt = "0.2.18"
-cargo_metadata = "0.8.0"
-log = "0.4.1"
-simple_logger = "1.3.0"
-xdg = "2.1.0"
+anyhow = "1.0"
+# cargo_metadata returns `camino::Utf8Path`; this converts it to `std::path`.
+camino = { version = "1.2", default-features = false }
+cargo_metadata = "0.23"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+dirs = "7"
+env_logger = "0.11"
+log = "0.4"
+notify = "8"
 serde = { version = "1.0", features = ["derive"] }
-config = "0.11"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

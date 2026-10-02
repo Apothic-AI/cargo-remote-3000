@@ -99,7 +99,7 @@ impl Config {
         Some(Remote {
             name: opts.name.clone().unwrap_or(blueprint_remote.name),
             host: opts.host.clone().unwrap_or(blueprint_remote.host),
-            ssh_port: opts.ssh_port.clone().unwrap_or(blueprint_remote.ssh_port),
+            ssh_port: opts.ssh_port.unwrap_or(blueprint_remote.ssh_port),
             temp_dir: opts.temp_dir.clone().unwrap_or(blueprint_remote.temp_dir),
             env: opts.env.clone().unwrap_or(blueprint_remote.env),
         })

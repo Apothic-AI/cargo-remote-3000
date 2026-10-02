@@ -178,7 +178,7 @@ fn main() {
     // transfer project to build server
     let mut rsync_to = Command::new("rsync");
     rsync_to
-        .arg("-a".to_owned())
+        .arg("-aP")
         .arg("--delete")
         .arg("--compress")
         .arg("-e")
@@ -219,7 +219,7 @@ fn main() {
 
     info!("Starting build process.");
     let output = Command::new("ssh")
-        .args(&["-p", &remote.ssh_port.to_string()])
+        .args(["-p", &remote.ssh_port.to_string()])
         .arg("-t")
         .arg(&build_server)
         .arg(build_command)
@@ -236,9 +236,13 @@ fn main() {
         info!("Transferring artifacts back to client.");
         let file_name = file_name.unwrap_or_else(String::new);
         Command::new("rsync")
-            .arg("-a")
+            .arg("-aP")
             .arg("--delete")
             .arg("--compress")
+            .arg("--exclude")
+            .arg("deps/")
+            .arg("--exclude")
+            .arg("build/")
             .arg("-e")
             .arg(format!("ssh -p {}", remote.ssh_port))
             .arg(PROGRESS_FLAG)
@@ -269,7 +273,7 @@ fn main() {
     if !no_copy_lock {
         info!("Transferring Cargo.lock file back to client.");
         Command::new("rsync")
-            .arg("-a")
+            .arg("-aP")
             .arg("--delete")
             .arg("--compress")
             .arg("-e")

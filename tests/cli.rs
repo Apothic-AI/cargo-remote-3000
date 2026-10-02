@@ -4,6 +4,12 @@
 //! `PATH`. The fakes record their argv to a log file and exit successfully,
 //! which lets the tests assert on exactly what would be transferred and run on
 //! the remote without needing a build server.
+//!
+//! Unix only: the fakes are `/bin/sh` scripts, and what they stand in for is a
+//! POSIX shell on the build host. The unit tests in `src/` still cover the
+//! platform-independent logic on Windows.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,14 +126,10 @@ exit {exit_code}
     }
 }
 
-#[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}
 
 fn write_crate(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).unwrap();
